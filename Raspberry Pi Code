@@ -1,0 +1,546 @@
+from flask import Flask, request, jsonify, render_template_string
+import time
+import threading
+
+app = Flask(__name__)
+
+# =====================================
+# CONFIGURATION
+# =====================================
+
+PORT = 5000
+
+# Task requirements
+PACKET_TIMEOUT = 5
+PRESENCE_MEMORY = 5 * 60
+UNATTENDED_LIMIT = 8 * 60
+COOKING_TEMP_RISE = 10.0
+
+# Example safety thresholds.
+# Calibrate these using your actual sensor readings.
+CRITICAL_TEMPERATURE = 70.0
+CRITICAL_SMOKE = 400
+
+# =====================================
+# SYSTEM DATA
+# =====================================
+
+lock = threading.Lock()
+
+system_state = "IDLE"
+alarm_reason = "System starting"
+
+latest_data = {
+    "temperature": None,
+    "humidity": None,
+    "smoke": None,
+    "distance": None,
+    "present": False
+}
+
+baseline_temperature = None
+
+last_packet_time = None
+last_presence_time = None
+unattended_start_time = None
+
+last_sequence = -1
+
+shutdown_latched = False
+
+server_start_time = time.monotonic()
+
+
+# =====================================
+# STATE MANAGEMENT
+# =====================================
+
+def update_system():
+
+    global system_state
+    global alarm_reason
+    global unattended_start_time
+    global shutdown_latched
+
+    now = time.monotonic()
+
+    # Check communication timeout
+    if last_packet_time is None:
+        if now - server_start_time >= PACKET_TIMEOUT:
+            shutdown_latched = True
+            system_state = "SHUT-OFF"
+            alarm_reason = "Sensor communication timeout"
+        return
+
+    if now - last_packet_time > PACKET_TIMEOUT:
+        shutdown_latched = True
+        system_state = "SHUT-OFF"
+        alarm_reason = "Sensor communication lost"
+        return
+
+    # Keep SHUT-OFF until a valid reset request
+    if shutdown_latched:
+        system_state = "SHUT-OFF"
+        return
+
+    temperature = latest_data["temperature"]
+    smoke = latest_data["smoke"]
+
+    if temperature is None or smoke is None:
+        system_state = "WARNING"
+        alarm_reason = "Invalid sensor readings"
+        return
+
+    # Critical temperature
+    if temperature >= CRITICAL_TEMPERATURE:
+        shutdown_latched = True
+        system_state = "SHUT-OFF"
+        alarm_reason = "Critical temperature detected"
+        return
+
+    # Critical smoke
+    if smoke >= CRITICAL_SMOKE:
+        shutdown_latched = True
+        system_state = "SHUT-OFF"
+        alarm_reason = "Critical smoke/gas level detected"
+        return
+
+    # Check whether cooking is happening
+    if baseline_temperature is None:
+        system_state = "IDLE"
+        alarm_reason = "Recording temperature baseline"
+        return
+
+    cooking_temperature = (
+        baseline_temperature + COOKING_TEMP_RISE
+    )
+
+    if temperature < cooking_temperature:
+
+        unattended_start_time = None
+        system_state = "IDLE"
+        alarm_reason = "No cooking detected"
+        return
+
+    # Cooking detected. Check recent presence.
+    if last_presence_time is not None:
+        presence_age = now - last_presence_time
+    else:
+        presence_age = float("inf")
+
+    if presence_age <= PRESENCE_MEMORY:
+
+        unattended_start_time = None
+        system_state = "COOKING"
+        alarm_reason = "Cooking with person present"
+        return
+
+    # Cooking is unattended
+    if unattended_start_time is None:
+        unattended_start_time = now
+
+    unattended_duration = now - unattended_start_time
+
+    if unattended_duration >= UNATTENDED_LIMIT:
+
+        shutdown_latched = True
+        system_state = "SHUT-OFF"
+        alarm_reason = "Cooking unattended for 8 minutes"
+
+    else:
+
+        system_state = "WARNING"
+        remaining = max(
+            0,
+            int(UNATTENDED_LIMIT - unattended_duration)
+        )
+
+        alarm_reason = (
+            "Unattended cooking. "
+            + str(remaining)
+            + " seconds remaining"
+        )
+
+
+# =====================================
+# RECEIVE ARDUINO DATA
+# =====================================
+
+@app.route("/api/data", methods=["POST"])
+def receive_data():
+
+    global last_packet_time
+    global last_sequence
+    global last_presence_time
+    global baseline_temperature
+    global shutdown_latched
+    global system_state
+    global alarm_reason
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "accepted": False,
+            "message": "Invalid JSON"
+        }), 400
+
+    required_fields = [
+        "sequence",
+        "temperature",
+        "humidity",
+        "smoke",
+        "distance",
+        "present"
+    ]
+
+    for field in required_fields:
+        if field not in data:
+            return jsonify({
+                "accepted": False,
+                "message": "Missing field: " + field
+            }), 400
+
+    try:
+        sequence = int(data["sequence"])
+        temperature = float(data["temperature"])
+        humidity = float(data["humidity"])
+        smoke = int(data["smoke"])
+        distance = float(data["distance"])
+        present = data["present"]
+
+        if not isinstance(present, bool):
+            raise ValueError("Present must be true or false")
+
+        if not (0 <= sequence <= 2147483647):
+            raise ValueError("Invalid sequence")
+
+        if not (-40 <= temperature <= 125):
+            raise ValueError("Temperature out of range")
+
+        if not (0 <= humidity <= 100):
+            raise ValueError("Humidity out of range")
+
+        if not (0 <= smoke <= 1023):
+            raise ValueError("Smoke reading out of range")
+
+        if not (0 <= distance <= 500):
+            raise ValueError("Distance out of range")
+
+    except (ValueError, TypeError, OverflowError):
+        return jsonify({
+            "accepted": False,
+            "message": "Invalid sensor values"
+        }), 400
+
+    with lock:
+
+        if sequence <= last_sequence:
+            return jsonify({
+                "accepted": False,
+                "message": "Old or duplicate packet",
+                "state": system_state
+            }), 400
+
+        last_sequence = sequence
+        last_packet_time = time.monotonic()
+
+        latest_data["temperature"] = temperature
+        latest_data["humidity"] = humidity
+        latest_data["smoke"] = smoke
+        latest_data["distance"] = distance
+        latest_data["present"] = present
+
+        # Record baseline from first valid reading
+        if baseline_temperature is None:
+            baseline_temperature = temperature
+
+        # Remember a nearby person
+        if present:
+            last_presence_time = time.monotonic()
+
+        # Check whether the Arduino requested a reset
+        reset_requested = data.get(
+            "reset_requested", False
+        )
+
+        if reset_requested is True:
+
+            safe_to_reset = (
+                temperature < baseline_temperature
+                + COOKING_TEMP_RISE
+                and temperature < CRITICAL_TEMPERATURE
+                and smoke < CRITICAL_SMOKE
+            )
+
+            if shutdown_latched and safe_to_reset:
+
+                shutdown_latched = False
+                system_state = "IDLE"
+                alarm_reason = "System reset successfully"
+
+                unattended_reset()
+
+            elif shutdown_latched:
+                alarm_reason = (
+                    "Reset rejected: readings are not safe"
+                )
+
+        # Evaluate current conditions
+        update_system()
+
+        response = {
+            "accepted": True,
+            "message": "Sensor data received",
+            "state": system_state,
+            "alarm": alarm_reason
+        }
+
+        print("--------------------------------")
+        print("Sequence:", sequence)
+        print("Temperature:", temperature)
+        print("Humidity:", humidity)
+        print("Smoke:", smoke)
+        print("Distance:", distance)
+        print("Person present:", present)
+        print("System state:", system_state)
+        print("Alarm:", alarm_reason)
+
+        return jsonify(response), 200
+
+
+def unattended_reset():
+    global unattended_start_time
+    unattended_start_time = None
+
+
+# =====================================
+# DASHBOARD STATUS API
+# =====================================
+
+@app.route("/api/status", methods=["GET"])
+def get_status():
+
+    with lock:
+
+        update_system()
+
+        now = time.monotonic()
+
+        if last_packet_time is None:
+            packet_age = None
+        else:
+            packet_age = round(
+                now - last_packet_time, 1
+            )
+
+        return jsonify({
+            "state": system_state,
+            "alarm": alarm_reason,
+            "temperature": latest_data["temperature"],
+            "humidity": latest_data["humidity"],
+            "smoke": latest_data["smoke"],
+            "distance": latest_data["distance"],
+            "present": latest_data["present"],
+            "baseline_temperature": baseline_temperature,
+            "packet_age": packet_age
+        })
+
+
+# =====================================
+# SIMPLE WEB DASHBOARD
+# =====================================
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kitchen Guard Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f2f4f7;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .container {
+            max-width: 650px;
+            margin: auto;
+        }
+
+        .card {
+            background: white;
+            padding: 18px;
+            margin: 12px 0;
+            border-radius: 10px;
+            box-shadow: 0 2px 6px #ccc;
+        }
+
+        .state {
+            font-size: 30px;
+            font-weight: bold;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+
+        .value {
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .label {
+            color: #555;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>Kitchen Guard</h1>
+    <p>Unattended Cooking Safety System</p>
+
+    <div class="card">
+        <div class="label">CURRENT SYSTEM STATE</div>
+        <div class="state" id="state">Loading...</div>
+        <p id="alarm">Waiting for Arduino...</p>
+    </div>
+
+    <div class="grid">
+
+        <div class="card">
+            <div class="label">Temperature</div>
+            <div class="value" id="temperature">--</div>
+            <span>°C</span>
+        </div>
+
+        <div class="card">
+            <div class="label">Humidity</div>
+            <div class="value" id="humidity">--</div>
+            <span>%</span>
+        </div>
+
+        <div class="card">
+            <div class="label">Smoke / Gas</div>
+            <div class="value" id="smoke">--</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Distance</div>
+            <div class="value" id="distance">--</div>
+            <span>cm</span>
+        </div>
+
+        <div class="card">
+            <div class="label">Person Present</div>
+            <div class="value" id="present">--</div>
+        </div>
+
+        <div class="card">
+            <div class="label">Packet Age</div>
+            <div class="value" id="packet">--</div>
+            <span>seconds</span>
+        </div>
+
+    </div>
+
+    <div class="card">
+        <div class="label">Temperature Baseline</div>
+        <div class="value" id="baseline">--</div>
+    </div>
+
+    <p>Kitchen Guard monitoring dashboard</p>
+
+</div>
+
+<script>
+async function updateDashboard() {
+
+    try {
+
+        const response = await fetch("/api/status");
+        const data = await response.json();
+
+        const stateElement = document.getElementById("state");
+
+        stateElement.textContent = data.state || "--";
+
+        if (data.state === "SHUT-OFF") {
+            stateElement.style.color = "red";
+        } else if (data.state === "WARNING") {
+            stateElement.style.color = "orange";
+        } else {
+            stateElement.style.color = "green";
+        }
+
+        document.getElementById("alarm").textContent =
+            data.alarm || "--";
+
+        document.getElementById("temperature").textContent =
+            data.temperature ?? "--";
+
+        document.getElementById("humidity").textContent =
+            data.humidity ?? "--";
+
+        document.getElementById("smoke").textContent =
+            data.smoke ?? "--";
+
+        document.getElementById("distance").textContent =
+            data.distance ?? "--";
+
+        document.getElementById("present").textContent =
+            data.present === true ? "YES" : "NO";
+
+        document.getElementById("packet").textContent =
+            data.packet_age ?? "--";
+
+        document.getElementById("baseline").textContent =
+            data.baseline_temperature ?? "--";
+
+    } catch (error) {
+        document.getElementById("alarm").textContent =
+            "Cannot connect to Raspberry Pi";
+    }
+}
+
+updateDashboard();
+setInterval(updateDashboard, 1000);
+</script>
+
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET"])
+def dashboard():
+    return render_template_string(HTML_PAGE)
+
+
+# =====================================
+# START SERVER
+# =====================================
+
+if __name__ == "__main__":
+
+    print("================================")
+    print("KITCHEN GUARD SERVER")
+    print("================================")
+    print("Starting Flask HTTP server...")
+    print("Port:", PORT)
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        threaded=True
+    )
