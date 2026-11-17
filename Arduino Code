@@ -1,0 +1,281 @@
+#include <WiFiNINA.h>
+#include <DHT.h>
+
+// ========== WIFI SETTINGS ==========
+char ssid[] = "1234578";
+char password[] = "12345678";
+
+// Raspberry Pi IP address
+char server[] = "192.168.81.46";
+const int serverPort = 5000;
+
+// ========== SENSOR PINS ==========
+#define DHT_PIN 2
+#define DHT_TYPE DHT22
+
+#define TRIG_PIN 4
+#define ECHO_PIN 3
+
+#define MQ_PIN A0
+
+// ========== OUTPUT PINS ==========
+#define BUZZER_PIN 6
+#define BUTTON_PIN 7
+#define RED_LED 9
+#define GREEN_LED 10
+
+// ========== SETTINGS ==========
+const float PRESENCE_DISTANCE = 100.0;
+
+// MQ sensor reading is sent to the Pi.
+// The smoke threshold is configured on the Pi.
+
+DHT dht(DHT_PIN, DHT_TYPE);
+WiFiClient client;
+
+unsigned long sequenceNumber = 0;
+unsigned long lastSendTime = 0;
+
+bool resetRequested = false;
+bool previousButtonState = HIGH;
+
+String currentState = "IDLE";
+String alarmReason = "";
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, HIGH);
+
+  dht.begin();
+
+  Serial.println("Kitchen Guard Starting");
+
+  connectWiFi();
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  checkButton();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (millis() - lastSendTime >= 1000) {
+    lastSendTime = millis();
+    sendSensorData();
+  }
+}
+
+// ========== WIFI CONNECTION ==========
+void connectWiFi() {
+  Serial.println("Connecting to WiFi...");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, password);
+
+    unsigned long startAttempt = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - startAttempt < 10000) {
+      checkButton();
+      delay(100);
+    }
+  }
+
+  Serial.println("WiFi connected");
+  Serial.print("Arduino IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ========== ULTRASONIC SENSOR ==========
+float readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration =
+      pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return 400.0;
+  }
+
+  return duration * 0.0343 / 2.0;
+}
+
+// ========== BUTTON ==========
+void checkButton() {
+  bool buttonState = digitalRead(BUTTON_PIN);
+
+  if (previousButtonState == HIGH &&
+      buttonState == LOW) {
+
+    delay(30);
+
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      resetRequested = true;
+      Serial.println("Reset requested");
+    }
+  }
+
+  previousButtonState = buttonState;
+}
+
+// ========== SEND SENSOR DATA ==========
+void sendSensorData() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("DHT22 reading error");
+    return;
+  }
+
+  int smokeValue = analogRead(MQ_PIN);
+  float distance = readDistance();
+
+  bool present = distance > 0 &&
+                 distance <= PRESENCE_DISTANCE;
+
+  sequenceNumber++;
+
+  String json = "{";
+  json += "\"sequence\":" + String(sequenceNumber) + ",";
+  json += "\"temperature\":" + String(temperature, 1) + ",";
+  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"smoke\":" + String(smokeValue) + ",";
+  json += "\"distance\":" + String(distance, 1) + ",";
+  json += "\"present\":" + String(present ? "true" : "false") + ",";
+  json += "\"reset_requested\":";
+  json += (resetRequested ? "true" : "false");
+  json += "}";
+
+  Serial.println();
+  Serial.println("Sending sensor data:");
+
+  Serial.println(json);
+
+  if (client.connect(server, serverPort)) {
+
+    client.println("POST /api/data HTTP/1.1");
+    client.print("Host: ");
+    client.println(server);
+    client.println("Content-Type: application/json");
+    client.print("Content-Length: ");
+    client.println(json.length());
+    client.println("Connection: close");
+    client.println();
+    client.println(json);
+
+    String response = "";
+
+    unsigned long timeout = millis();
+
+    while (millis() - timeout < 3000) {
+      while (client.available()) {
+        response += (char)client.read();
+        timeout = millis();
+      }
+
+      if (!client.connected()) {
+        break;
+      }
+    }
+
+    client.stop();
+
+    Serial.println("Server response:");
+    Serial.println(response);
+
+    readServerState(response);
+
+    resetRequested = false;
+
+  } else {
+    Serial.println("Could not connect to Raspberry Pi");
+    client.stop();
+  }
+}
+
+// ========== READ STATE FROM PI ==========
+void readServerState(String response) {
+  int bodyPosition = response.indexOf("\r\n\r\n");
+
+  if (bodyPosition < 0) {
+    Serial.println("Invalid HTTP response");
+    return;
+  }
+
+  String body = response.substring(bodyPosition + 4);
+
+  int statePosition = body.indexOf("\"state\":\"");
+
+  if (statePosition < 0) {
+    Serial.println("State not received from Pi");
+    return;
+  }
+
+  statePosition += 9;
+
+  int stateEnd = body.indexOf("\"", statePosition);
+
+  if (stateEnd < 0) {
+    return;
+  }
+
+  currentState = body.substring(statePosition, stateEnd);
+
+  Serial.print("System state: ");
+  Serial.println(currentState);
+
+  controlOutputs();
+}
+
+// ========== LED AND BUZZER CONTROL ==========
+void controlOutputs() {
+
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  if (currentState == "IDLE") {
+    digitalWrite(GREEN_LED, HIGH);
+  }
+
+  else if (currentState == "COOKING") {
+    digitalWrite(GREEN_LED, HIGH);
+  }
+
+  else if (currentState == "WARNING") {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+
+  else if (currentState == "SHUT-OFF" ||
+           currentState == "SHUT_OFF") {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+
+  else {
+    // Unknown state: indicate a communication/problem state
+    digitalWrite(RED_LED, HIGH);
+  }
+}
